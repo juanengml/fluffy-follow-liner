@@ -1,0 +1,178 @@
+#include "HUSKYLENS.h"
+#include "Wire.h"
+#include <AFMotor.h>
+
+// Inicialização dos motores
+AF_DCMotor rightFront(1);
+AF_DCMotor rightBack(2);
+AF_DCMotor leftFront(3);
+AF_DCMotor leftBack(4);
+
+HUSKYLENS huskylens;
+
+// Parâmetros do sistema
+const int SCREEN_CENTER = 160;
+const int MAX_SPEED = 255;
+const int MIN_SPEED = 70;
+const int BASE_SPEED = 140;  // Reduzido para controle mais suave
+const int MAX_FRAMES_WITHOUT_DETECTION = 10;
+
+// Parâmetros do PID - comece com valores conservadores
+const float Kp = 0.8;  // Ganho Proporcional
+const float Ki = 0.1;  // Ganho Integral
+const float Kd = 0.2;  // Ganho Derivativo
+
+// Classe para controle PID
+class PIDController {
+    private:
+        float kp, ki, kd;
+        float lastError;
+        float integral;
+        unsigned long lastTime;
+        float maxIntegral;  // Limita acumulação integral
+        
+    public:
+        PIDController(float p, float i, float d) {
+            kp = p;
+            ki = i;
+            kd = d;
+            lastError = 0;
+            integral = 0;
+            lastTime = millis();
+            maxIntegral = 50;  // Ajuste este valor conforme necessário
+        }
+        
+        float compute(float error) {
+            // Calcula o tempo desde a última atualização
+            unsigned long now = millis();
+            float deltaTime = (now - lastTime) / 1000.0;
+            lastTime = now;
+            
+            // Evita divisão por zero
+            if (deltaTime <= 0) return 0;
+            
+            // Termo Integral - acumula o erro
+            integral += error * deltaTime;
+            
+            // Limita o termo integral para evitar acumulação excessiva
+            integral = constrain(integral, -maxIntegral, maxIntegral);
+            
+            // Termo Derivativo - taxa de mudança do erro
+            float derivative = (error - lastError) / deltaTime;
+            lastError = error;
+            
+            // Calcula a saída PID combinada
+            return (kp * error) + (ki * integral) + (kd * derivative);
+        }
+        
+        void reset() {
+            integral = 0;
+            lastError = 0;
+            lastTime = millis();
+        }
+};
+
+// Instância global do controlador PID
+PIDController pid(Kp, Ki, Kd);
+int framesWithoutDetection = 0;
+
+void setup() {
+    Serial.begin(115200);
+    Wire.begin();
+    
+    // Configura velocidade inicial dos motores
+    rightFront.setSpeed(BASE_SPEED);
+    rightBack.setSpeed(BASE_SPEED);
+    leftFront.setSpeed(BASE_SPEED);
+    leftBack.setSpeed(BASE_SPEED);
+    
+    while (!huskylens.begin(Wire)) {
+        Serial.println(F("Falha na conexão com HuskyLens! Verificando conexões..."));
+        delay(100);
+    }
+    
+    Serial.println("Sistema inicializado com controle PID!");
+}
+
+void motorControl(float pidOutput) {
+    // Calcula velocidades com base na saída PID
+    int leftSpeed = BASE_SPEED - pidOutput;
+    int rightSpeed = BASE_SPEED + pidOutput;
+    
+    // Limita as velocidades
+    leftSpeed = constrain(leftSpeed, MIN_SPEED, MAX_SPEED);
+    rightSpeed = constrain(rightSpeed, MIN_SPEED, MAX_SPEED);
+    
+    // Aplica velocidades aos motores
+    leftFront.setSpeed(abs(leftSpeed));
+    leftBack.setSpeed(abs(leftSpeed));
+    rightFront.setSpeed(abs(rightSpeed));
+    rightBack.setSpeed(abs(rightSpeed));
+    
+    // Define direções
+    if(leftSpeed >= 0) {
+        leftFront.run(FORWARD);
+        leftBack.run(FORWARD);
+    } else {
+        leftFront.run(BACKWARD);
+        leftBack.run(BACKWARD);
+    }
+    
+    if(rightSpeed >= 0) {
+        rightFront.run(FORWARD);
+        rightBack.run(FORWARD);
+    } else {
+        rightFront.run(BACKWARD);
+        rightBack.run(BACKWARD);
+    }
+    
+    // Debug
+    Serial.println("-------------------");
+    Serial.print("Saída PID: "); Serial.println(pidOutput);
+    Serial.print("Velocidade Esquerda: "); Serial.println(leftSpeed);
+    Serial.print("Velocidade Direita: "); Serial.println(rightSpeed);
+}
+
+void stopMotors() {
+    rightFront.run(RELEASE);
+    rightBack.run(RELEASE);
+    leftFront.run(RELEASE);
+    leftBack.run(RELEASE);
+    pid.reset();  // Importante: reseta o PID quando para
+    Serial.println("Motores parados - Nenhum objeto detectado");
+}
+
+void loop() {
+    if (!huskylens.request()) {
+        Serial.println("Erro de comunicação com HuskyLens");
+        stopMotors();
+        return;
+    }
+
+    if (!huskylens.available()) {
+        framesWithoutDetection++;
+        Serial.print("Frames sem detecção: ");
+        Serial.println(framesWithoutDetection);
+        
+        if (framesWithoutDetection >= MAX_FRAMES_WITHOUT_DETECTION) {
+            stopMotors();
+        }
+        return;
+    }
+
+    framesWithoutDetection = 0;
+
+    while (huskylens.available()) {
+        HUSKYLENSResult result = huskylens.read();
+        if (result.command == COMMAND_RETURN_BLOCK) {
+            // Calcula o erro em relação ao centro
+            float error = SCREEN_CENTER - result.xCenter;
+            
+            // Calcula a saída do controlador PID
+            float pidOutput = pid.compute(error);
+            
+            // Aplica o controle aos motores
+            motorControl(pidOutput);
+        }
+    }
+}
